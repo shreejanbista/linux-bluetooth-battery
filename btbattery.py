@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 
@@ -408,7 +409,7 @@ class BatteryTray(QObject):
         m.addSeparator()
         au = m.addAction("Start on login")
         au.setCheckable(True)
-        au.setChecked(os.path.exists(autostart_path()))
+        au.setChecked(autostart_enabled())
         au.toggled.connect(set_autostart)
         m.addAction(QIcon.fromTheme("application-exit"), "Quit", self.app.quit)
 
@@ -421,12 +422,35 @@ class BatteryTray(QObject):
 # --------------------------------------------------------------------------- autostart
 
 
+SERVICE = f"{APP_ID}.service"
+
+
+def _config_dir() -> str:
+    return os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+
+
 def autostart_path() -> str:
-    base = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
-    return os.path.join(base, "autostart", f"{APP_ID}.desktop")
+    return os.path.join(_config_dir(), "autostart", f"{APP_ID}.desktop")
+
+
+def _has_service() -> bool:
+    return os.path.exists(os.path.join(_config_dir(), "systemd", "user", SERVICE))
+
+
+def autostart_enabled() -> bool:
+    if _has_service():
+        r = subprocess.run(["systemctl", "--user", "is-enabled", SERVICE],
+                           capture_output=True, text=True)
+        return r.stdout.strip() == "enabled"
+    return os.path.exists(autostart_path())
 
 
 def set_autostart(on: bool):
+    # Installed via install.sh -> a systemd user service; otherwise an XDG autostart entry.
+    if _has_service():
+        subprocess.run(["systemctl", "--user", "enable" if on else "disable", SERVICE],
+                       capture_output=True)
+        return
     path = autostart_path()
     if on:
         os.makedirs(os.path.dirname(path), exist_ok=True)

@@ -19,8 +19,18 @@ StatusNotifierItem tray.
 ## Install
 
 ```bash
-./install.sh            # installs to ~/.local/bin, autostarts on login, launches now
+./install.sh            # installs to ~/.local/bin and starts it as a systemd user service
 ./install.sh uninstall
+```
+
+The app runs as the `btbattery` systemd user service. It starts with your desktop session,
+restarts itself if it crashes, and keeps running when the terminal that installed it is
+closed.
+
+```bash
+systemctl --user status btbattery     # is it running?
+systemctl --user restart btbattery    # bring the icons back after choosing Quit
+journalctl --user -u btbattery        # logs
 ```
 
 The only requirement is `python-pyqt6`, which comes with KDE.
