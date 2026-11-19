@@ -226,10 +226,8 @@ class BatteryTray(QObject):
         self.placeholder = QSystemTrayIcon(_device_glyph("bluetooth"), self)
         self.placeholder.setToolTip(f"{APP_NAME}: no connected devices reporting battery")
         self.placeholder.activated.connect(self._on_activated)
-
-        self.menu = QMenu()
-        self.menu.aboutToShow.connect(self._build_menu)
-        self.placeholder.setContextMenu(self.menu)
+        self.menus: list[QMenu] = []
+        self.placeholder.setContextMenu(self._new_menu())
 
         # Debounced rescan on any BlueZ change
         self.debounce = QTimer(self, singleShot=True, interval=300)
@@ -292,16 +290,15 @@ class BatteryTray(QObject):
         hidden, style, low, fg = self.hidden, self.style, self.low, self.fg_color()
         visible = {d.path: d for d in self.devices if d.address not in hidden}
 
-        for path in list(self.icons):
-            if path not in visible:
-                self.icons.pop(path).hide()
-                self.last_sig.pop(path, None)
+        # Show before hiding: Qt ends the app when its last visible tray icon is hidden.
+        if not visible:
+            self.placeholder.show()
 
         for path, d in visible.items():
             tray = self.icons.get(path)
             if tray is None:
                 tray = QSystemTrayIcon(self)
-                tray.setContextMenu(self.menu)
+                tray.setContextMenu(self._new_menu())
                 tray.activated.connect(self._on_activated)
                 self.icons[path] = tray
             sig = (d.percentage, d.name, d.icon, style, low, fg.name())
@@ -314,7 +311,12 @@ class BatteryTray(QObject):
                 tray.show()
             self._check_alert(d)
 
-        self.placeholder.setVisible(not self.icons)
+        # Hide (never destroy) icons whose device went away; they are re-shown if it returns.
+        for path, tray in self.icons.items():
+            if path not in visible and tray.isVisible():
+                tray.hide()
+        if visible and self.placeholder.isVisible():
+            self.placeholder.hide()
 
     def _check_alert(self, d: Device):
         low = self.low
@@ -342,8 +344,17 @@ class BatteryTray(QObject):
             self.refresh(force=True)
 
     # ---- menu
-    def _build_menu(self):
-        m = self.menu
+    def _new_menu(self) -> QMenu:
+        # Every tray icon needs its OWN QMenu. Sharing one menu between several
+        # icons makes KDE's StatusNotifierItem free it when any one icon is
+        # hidden, and the next click on another icon segfaults.
+        m = QMenu()
+        m.aboutToShow.connect(lambda m=m: self._build_menu(m))
+        self._build_menu(m)
+        self.menus.append(m)
+        return m
+
+    def _build_menu(self, m: QMenu):
         m.clear()
         hidden = self.hidden
         all_devs = self.devices
@@ -457,6 +468,7 @@ def main() -> int:
     app.setApplicationDisplayName(APP_NAME)
     app.setDesktopFileName(APP_ID)
     app.setQuitOnLastWindowClosed(False)
+    app.setQuitLockEnabled(False)  # hiding the last tray icon must not end the app
 
     session = QDBusConnection.sessionBus()
     if not session.registerService(BUS_NAME):

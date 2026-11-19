@@ -9,8 +9,16 @@ APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications/btbattery.desktop"
 AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/btbattery.desktop"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+# Stop a running instance: only the process that owns the app's D-Bus name.
+stop_running() {
+  local pid
+  pid=$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus \
+        GetConnectionUnixProcessID s io.github.btbattery 2>/dev/null | awk '{print $2}')
+  [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && sleep 0.5 || true
+}
+
 if [[ "${1:-}" == "uninstall" ]]; then
-  pkill -f "$BIN" 2>/dev/null || true
+  stop_running
   rm -f "$BIN" "$APPS" "$AUTOSTART"
   echo "Uninstalled. (Settings remain in ~/.config/btbattery/)"
   exit 0
@@ -34,7 +42,7 @@ X-KDE-autostart-after=panel"
 install -Dm644 /dev/stdin "$APPS" <<<"$DESKTOP"
 install -Dm644 /dev/stdin "$AUTOSTART" <<<"$DESKTOP"
 
-pkill -f "$BIN" 2>/dev/null || true
+stop_running
 nohup "$BIN" >/dev/null 2>&1 &
 disown
 echo "Installed to $BIN, set to start on login, and launched."
