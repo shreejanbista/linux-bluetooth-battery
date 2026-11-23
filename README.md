@@ -12,7 +12,8 @@ StatusNotifierItem tray.
 - Sends a desktop notification at low battery (5–40%, default 15%). It fires once and re-arms after the level rises 10 points above the threshold.
 - Refreshes as soon as BlueZ signals a change, and also polls every 15 seconds to 5 minutes as a fallback.
 - Right-click menu: show or hide each device, icon style, alert threshold, poll interval, refresh, start on login, quit.
-- `--list` and `--json` print the current levels for scripts and bar widgets.
+- Battery history window: a chart of each device's level, how long each charge lasted, drain rate, and an estimate of time left (also shown in the icon's tooltip).
+- `--list`, `--json` and `--history` print the current levels for scripts and bar widgets.
 
 ![Icon styles on dark and light panels](docs/icon-styles.png)
 
@@ -49,6 +50,22 @@ settings. If an older system doesn't show your headset, try setting
 `Experimental = true` in `/etc/bluetooth/main.conf`, restarting the `bluetooth`
 service, and reconnecting the headset. Some headsets don't report battery to the
 host at all.
+
+## Battery history
+
+Right-click any icon and choose **Battery history…**. The window shows:
+
+- the current level, an estimate of time left, the drain rate, and how long a full charge lasts;
+- a chart of the level over 24 hours, 7 days, 30 days or all time (green markers are charges, gaps are times the device wasn't connected);
+- a list of past charges with how long each one lasted.
+
+The app records a reading when the level changes, and at least once an hour while a
+device is connected. Readings are kept for a year in `~/.local/share/btbattery/history.tsv`
+(under 1 MB) and never leave your computer. A rise of 8 points or more counts as a
+charge. Estimates appear once the level has dropped a few percent over at least 6 hours.
+Right after a charge, the estimates use earlier charges until there's enough new data.
+The app only records while it's running, so time the device spends off or disconnected
+shows as a gap rather than a guess.
 
 ## Tips
 
