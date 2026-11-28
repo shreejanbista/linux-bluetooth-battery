@@ -61,8 +61,15 @@ Right-click any icon and choose **Battery history…**. The window shows:
 
 The app records a reading when the level changes, and at least once an hour while a
 device is connected. Readings are kept for a year in `~/.local/share/btbattery/history.tsv`
-(under 1 MB) and never leave your computer. A rise of 8 points or more counts as a
-charge. Estimates appear once the level has dropped a few percent over at least 6 hours.
+(under 1 MB) and never leave your computer. A rise counts as a charge when the level
+climbs at least 8 points above its highest point in the past hour and stays there.
+Two device quirks are ignored: a placeholder 100% sent at the moment of connecting
+that falls straight back, and flipping between two coarse steps (e.g. 30% ↔ 40%).
+
+When a device connects, its icon shows the last known level, faded, until the device
+sends a trustworthy reading. That's usually within 1–2 seconds, and never more than
+10 seconds. Some devices report a placeholder 100% for that first moment, so it's
+neither shown nor recorded. Estimates appear once the level has dropped a few percent over at least 6 hours.
 Right after a charge, the estimates use earlier charges until there's enough new data.
 The app only records while it's running, so time the device spends off or disconnected
 shows as a gap rather than a guess.

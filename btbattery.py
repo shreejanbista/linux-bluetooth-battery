@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from PyQt6.QtCore import QMetaType, QObject, QPointF, QRectF, QSettings, Qt, QTimer, QVariant, pyqtSlot
 from PyQt6.QtDBus import QDBusArgument, QDBusConnection, QDBusMessage, QDBusVariant
@@ -153,15 +153,20 @@ def _fit_font(p: QPainter, text: str, rect: QRectF, bold=True) -> QFont:
     return f
 
 
-def render_pixmap(dev: Device, size: int, style: str, low: int, fg: QColor) -> QPixmap:
+def render_pixmap(dev: Device, size: int, style: str, low: int, fg: QColor, pending=False) -> QPixmap:
+    """pending: the device just connected and its real level isn't known yet -> faded icon.
+    A percentage below 0 means no level at all yet and is drawn as "…"."""
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    if pending:
+        p.setOpacity(0.45)
     s = float(size)
-    col = level_color(dev.percentage, low)
-    text = str(dev.percentage)
+    unknown = dev.percentage < 0
+    col = fg if unknown else level_color(dev.percentage, low)
+    text = "…" if unknown else str(dev.percentage)
     glyph = _device_glyph(dev.icon)
 
     def draw_text(rect: QRectF, color: QColor):
@@ -206,10 +211,10 @@ def _bar(p: QPainter, r: QRectF, pct: int, col: QColor, fg: QColor, vertical=Fal
     p.fillPath(fp, col)
 
 
-def build_icon(dev: Device, style: str, low: int, fg: QColor) -> QIcon:
+def build_icon(dev: Device, style: str, low: int, fg: QColor, pending=False) -> QIcon:
     ic = QIcon()
     for sz in ICON_SIZES:
-        ic.addPixmap(render_pixmap(dev, sz, style, low, fg))
+        ic.addPixmap(render_pixmap(dev, sz, style, low, fg, pending))
     return ic
 
 
@@ -347,13 +352,86 @@ class Analysis:
     last_charge_ts: int | None
 
 
+GLITCH_WINDOW = 300         # a jump up that falls back within 5 min wasn't a real charge
+RECENT_WINDOW = 3600        # a charge must climb CHARGE_RISE above the past hour's highest level
+
+
+def _recent_max(samples: list[tuple[int, int]], k: int) -> int:
+    """Highest level at or before samples[k] within RECENT_WINDOW, including the level in effect
+    when that window began. Devices that report in coarse steps (e.g. 10%) flip back and forth
+    between two steps; climbing back to a level seen minutes ago is not a charge."""
+    since = samples[k][0] - RECENT_WINDOW
+    best = samples[k][1]
+    while k >= 0:
+        best = max(best, samples[k][1])
+        if samples[k][0] <= since:     # the level in effect when the window began
+            break
+        k -= 1
+    return best
+
+
+def drop_glitches(samples: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Remove readings that jump up and then fall straight back.
+
+    Some devices (e.g. cheap mice) report a placeholder 100% the moment they
+    connect, then their real level a second later. Without this, every
+    power-on would look like a charge. Normal drops are never touched."""
+    out: list[tuple[int, int]] = []
+    for i, (ts, pct) in enumerate(samples):
+        if out and pct >= out[-1][1] + CHARGE_RISE:
+            later = [p for t, p in samples[i + 1:] if t - ts <= GLITCH_WINDOW]
+            if any(p <= pct - CHARGE_RISE for p in later):
+                continue
+        out.append((ts, pct))
+    return out
+
+
+SETTLE_SECONDS = 10
+
+
+class Settler:
+    """Hold back a device's first reading after it connects.
+
+    Its first reading is only trusted once a different one arrives (the real
+    level, usually within 1-2 s) or SETTLE_SECONDS pass without a change
+    (the first reading was real). Until then the device is "pending"."""
+
+    def __init__(self):
+        self.state: dict[str, list] = {}     # address -> [connected_at, first_pct, settled]
+        self.started = False
+
+    def update(self, devices: list[Device], now: float) -> dict[str, bool]:
+        """Returns {address: pending}."""
+        seen = {d.address for d in devices}
+        for addr in list(self.state):
+            if addr not in seen:
+                del self.state[addr]             # disconnected: settle again next time
+        out = {}
+        for d in devices:
+            st = self.state.get(d.address)
+            if st is None:
+                # Devices already connected when the app starts are past their first reading.
+                st = self.state[d.address] = [now, d.percentage, not self.started]
+            if not st[2] and (d.percentage != st[1] or now - st[0] >= SETTLE_SECONDS):
+                st[2] = True
+            out[d.address] = not st[2]
+        self.started = True
+        return out
+
+    def seconds_to_next_deadline(self, now: float) -> float | None:
+        waits = [st[0] + SETTLE_SECONDS - now for st in self.state.values() if not st[2]]
+        return max(0.0, min(waits)) if waits else None
+
+
 def analyze(samples: list[tuple[int, int]], now: int | None = None) -> Analysis:
     now = int(now if now is not None else time.time())
+    samples = drop_glitches(samples)
     if not samples:
         return Analysis([], None, None, False, None, None, None)
 
-    # Find charge events: a climb (consecutive non-decreasing samples) of >= CHARGE_RISE points.
-    # Smaller wobbles are measurement noise. A session starts at the top of each climb.
+    # Find charge events: a climb (consecutive non-decreasing samples) that ends at least
+    # CHARGE_RISE points above the highest level of the past hour. Smaller wobbles and
+    # flipping between coarse steps are noise. A session starts at the top of each climb.
     sessions: list[Session] = []
     start, after_charge, i, n = 0, False, 1, len(samples)
     while i < n:
@@ -361,7 +439,7 @@ def analyze(samples: list[tuple[int, int]], now: int | None = None) -> Analysis:
             j = i
             while j + 1 < n and samples[j + 1][1] >= samples[j][1]:
                 j += 1
-            if samples[j][1] - samples[i - 1][1] >= CHARGE_RISE:
+            if samples[j][1] >= _recent_max(samples, i - 1) + CHARGE_RISE:
                 a, b = samples[start], samples[i - 1]
                 if i - 1 > start or after_charge:
                     sessions.append(Session(a[0], a[1], b[0], b[1], after_charge, False))
@@ -711,7 +789,7 @@ class HistoryWindow(QWidget):
         if t0 >= now:
             t0 = now - 3600
         charges = [s.start_ts for s in a.sessions if s.after_charge]
-        self.chart.set_data(samples, charges, t0, now, self.tray.low)
+        self.chart.set_data(drop_glitches(samples), charges, t0, now, self.tray.low)
 
         self.table.clear()
         for s in reversed(a.sessions):
@@ -753,6 +831,10 @@ class BatteryTray(QObject):
         self.last_sig: dict[str, tuple] = {}
         self.history = History()
         self.history_window: HistoryWindow | None = None
+        self.settler = Settler()
+        self.pending: dict[str, bool] = {}
+        self.settle_timer = QTimer(self, singleShot=True)
+        self.settle_timer.timeout.connect(self.refresh)
 
         self.placeholder = QSystemTrayIcon(_device_glyph("bluetooth"), self)
         self.placeholder.setToolTip(f"{APP_NAME}: no connected devices reporting battery")
@@ -818,7 +900,15 @@ class BatteryTray(QObject):
 
     def refresh(self, force=False):
         self.devices = read_devices(self.sys)
-        wrote = self.history.record(self.devices)
+        now = time.time()
+        self.pending = self.settler.update(self.devices, now)
+        # Only settled readings go into history; a just-connected device's first value may be fake.
+        wrote = self.history.record([d for d in self.devices if not self.pending[d.address]])
+        wait = self.settler.seconds_to_next_deadline(now)
+        if wait is not None:
+            self.settle_timer.start(int(wait * 1000) + 300)   # re-check when the wait is up
+        else:
+            self.settle_timer.stop()
         hidden, style, low, fg = self.hidden, self.style, self.low, self.fg_color()
         visible = {d.path: d for d in self.devices if d.address not in hidden}
 
@@ -827,20 +917,23 @@ class BatteryTray(QObject):
             self.placeholder.show()
 
         for path, d in visible.items():
+            pending = self.pending.get(d.address, False)
+            d = self._shown(d)
             tray = self.icons.get(path)
             if tray is None:
                 tray = QSystemTrayIcon(self)
                 tray.setContextMenu(self._new_menu(d.address))
                 tray.activated.connect(self._on_activated)
                 self.icons[path] = tray
-            sig = (d.percentage, d.name, d.icon, style, low, fg.name())
+            sig = (d.percentage, pending, d.name, d.icon, style, low, fg.name())
             if force or self.last_sig.get(path) != sig:
-                tray.setIcon(build_icon(d, style, low, fg))
+                tray.setIcon(build_icon(d, style, low, fg, pending))
                 self.last_sig[path] = sig
-            tray.setToolTip(self._tooltip(d))
+            tray.setToolTip(self._tooltip(d, pending))
             if not tray.isVisible():
                 tray.show()
-            self._check_alert(d)
+            if not pending:
+                self._check_alert(d)
 
         # Hide (never destroy) icons whose device went away; they are re-shown if it returns.
         for path, tray in self.icons.items():
@@ -852,7 +945,18 @@ class BatteryTray(QObject):
         if self.history_window and self.history_window.isVisible() and (wrote or force):
             self.history_window.reload()
 
-    def _tooltip(self, d: Device) -> str:
+    def _last_known(self, addr: str) -> int:
+        clean = drop_glitches(self.history.samples.get(addr, []))
+        return clean[-1][1] if clean else -1
+
+    def _shown(self, d: Device) -> Device:
+        """The device as displayed: while pending, its last trustworthy level (or -1 = unknown)."""
+        return replace(d, percentage=self._last_known(d.address)) if self.pending.get(d.address) else d
+
+    def _tooltip(self, d: Device, pending=False) -> str:
+        if pending:
+            last = f"last known {d.percentage}%" if d.percentage >= 0 else "no earlier reading"
+            return f"{d.name}\n{d.kind} · checking battery… ({last})"
         lines = [d.name, f"{d.kind} · {d.percentage}%"]
         a = analyze(self.history.samples.get(d.address, []))
         if a.time_left is not None:
@@ -911,7 +1015,8 @@ class BatteryTray(QObject):
             a = m.addAction("  No connected devices report battery")
             a.setEnabled(False)
         for d in all_devs:
-            a = m.addAction(_device_glyph(d.icon), f"{d.name} — {d.percentage}%")
+            level = "checking…" if self.pending.get(d.address) else f"{d.percentage}%"
+            a = m.addAction(_device_glyph(d.icon), f"{d.name} — {level}")
             a.setCheckable(True)
             a.setChecked(d.address not in hidden)
             a.setToolTip("Show / hide this device's panel icon")
